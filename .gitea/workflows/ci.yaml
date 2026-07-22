@@ -1,0 +1,298 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Maven
+        run: |
+          apt-get update
+          apt-get install -y maven
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - run: mvn -B -ntp test package
+
+      - name: Validar classes obrigatórias
+        run: |
+          if [ ! -f expected_classes.txt ]; then
+            echo "❌ Arquivo expected_classes.txt não encontrado."
+            exit 1
+          fi
+
+          CLASSES_OBRIGATORIAS=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"
+            line="$(echo "$line" | xargs)"
+            [ -z "$line" ] && continue
+            CLASSES_OBRIGATORIAS+=("$line")
+          done < expected_classes.txt
+
+          if [ ${#CLASSES_OBRIGATORIAS[@]} -eq 0 ]; then
+            echo "❌ Nenhuma classe obrigatória listada em expected_classes.txt."
+            exit 1
+          fi
+
+          if [ ! -d src/main/java ]; then
+            echo "❌ Diretório src/main/java não encontrado."
+            exit 1
+          fi
+
+          echo "Buscando classes obrigatórias em src/main/java..."
+          FALHOU=0
+          for CLASSE in "${CLASSES_OBRIGATORIAS[@]}"; do
+            if find src/main/java -name "${CLASSE}.java" -print -quit | grep -q .; then
+              echo "✅ Encontrado: $CLASSE"
+            else
+              echo "❌ NÃO encontrado: $CLASSE"
+              FALHOU=1
+            fi
+          done
+
+          if [ "$FALHOU" -eq 1 ]; then
+            echo ""
+            echo "Uma ou mais classes obrigatórias não foram implementadas."
+            echo "Consulte o README e expected_classes.txt para os nomes exigidos."
+            exit 1
+          fi
+
+          echo ""
+          echo "Todas as classes obrigatórias foram encontradas."
+
+      - name: Validar testes obrigatórios
+        run: |
+          if [ ! -f expected_tests.txt ]; then
+            echo "❌ Arquivo expected_tests.txt não encontrado."
+            exit 1
+          fi
+
+          TESTES_OBRIGATORIOS=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"
+            line="$(echo "$line" | xargs)"
+            [ -z "$line" ] && continue
+            TESTES_OBRIGATORIOS+=("$line")
+          done < expected_tests.txt
+
+          if [ ${#TESTES_OBRIGATORIOS[@]} -eq 0 ]; then
+            echo "❌ Nenhum teste obrigatório listado em expected_tests.txt."
+            exit 1
+          fi
+
+          if ! find . -type d -name surefire-reports 2>/dev/null | grep -q .; then
+            echo "❌ Nenhum diretório surefire-reports encontrado. Os testes foram executados?"
+            exit 1
+          fi
+
+          echo "Verificando execução e resultado dos testes obrigatórios via relatórios do Surefire..."
+
+          python3 - "${TESTES_OBRIGATORIOS[@]}" <<'PYEOF'
+          import sys, glob, xml.etree.ElementTree as ET
+
+          expected = sys.argv[1:]
+          executed = {}
+
+          for xml_file in glob.glob('**/surefire-reports/TEST-*.xml', recursive=True):
+              try:
+                  root = ET.parse(xml_file).getroot()
+              except ET.ParseError:
+                  continue
+              for tc in root.findall('testcase'):
+                  classname = tc.get('classname', '')
+                  name = tc.get('name', '')
+                  status = 'ok'
+                  if tc.find('failure') is not None:
+                      status = 'failure'
+                  elif tc.find('error') is not None:
+                      status = 'error'
+                  elif tc.find('skipped') is not None:
+                      status = 'skipped'
+                  executed[f'{classname}#{name}'] = status
+                  executed.setdefault(name, status)  # permite listar só o nome do método
+
+          failed = False
+          for exp in expected:
+              status = executed.get(exp)
+              if status is None:
+                  print(f'❌ NÃO encontrado (não executado): {exp}')
+                  failed = True
+              elif status in ('failure', 'error'):
+                  print(f'❌ Encontrado mas FALHOU ({status}): {exp}')
+                  failed = True
+              elif status == 'skipped':
+                  print(f'⚠️  Encontrado mas foi SKIPPED: {exp}')
+                  failed = True
+              else:
+                  print(f'✅ Encontrado e passou: {exp}')
+
+          sys.exit(1 if failed else 0)
+          PYEOF
+
+          if [ $? -ne 0 ]; then
+            echo ""
+            echo "Um ou mais testes obrigatórios não foram implementados, não passaram ou não foram executados."
+            echo "Consulte o README e expected_tests.txt para os nomes exigidos (formato recomendado: Classe#metodo)."
+            exit 1
+          fi
+
+          echo ""
+          echo "Todos os testes obrigatórios foram encontrados e passaram."
+
+      - name: Análise SonarQube
+        env:
+          SONAR_TOKEN: ${{ vars.SONAR_TOKEN != '' && vars.SONAR_TOKEN || secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL != '' && vars.SONAR_HOST_URL || secrets.SONAR_HOST_URL }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "SONAR_TOKEN não encontrado no workflow."
+            echo "Configure em Settings > Actions como Secret ou Variable (SONAR_TOKEN)."
+            echo "Secrets globais do admin podem não estar disponíveis — use o nível da organização ou do repositório."
+            exit 1
+          fi
+          if [ -z "$SONAR_HOST_URL" ]; then
+            echo "SONAR_HOST_URL não encontrado no workflow."
+            echo "Configure em Settings > Actions como Variable ou Secret com a URL completa (ex.: https://sonarcloud.io)."
+            exit 1
+          fi
+          case "$SONAR_HOST_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "SONAR_HOST_URL inválida: '$SONAR_HOST_URL'. Use o formato completo, ex.: https://sonarcloud.io"
+              exit 1
+              ;;
+          esac
+          SONAR_PROJECT_KEY="${{ gitea.repository }}"
+          SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY//\//_}"
+          echo "SONAR_PROJECT_KEY=${SONAR_PROJECT_KEY}" >> "$GITHUB_ENV"
+          mvn -B -ntp \
+            org.jacoco:jacoco-maven-plugin:prepare-agent \
+            verify \
+            org.jacoco:jacoco-maven-plugin:report \
+            sonar:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="${{ gitea.repository }}" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.qualitygate.wait=true
+
+      - name: Notify LMS
+        if: always()
+        env:
+          LMS_CONTENT_URL: ${{ vars.LMS_CONTENT_URL != '' && vars.LMS_CONTENT_URL || secrets.LMS_CONTENT_URL }}
+          LMS_CONTENT_INTERNAL_URL: ${{ vars.LMS_CONTENT_INTERNAL_URL != '' && vars.LMS_CONTENT_INTERNAL_URL || secrets.LMS_CONTENT_INTERNAL_URL }}
+          LMS_PIPELINE_HOOK_URL: ${{ vars.LMS_PIPELINE_HOOK_URL != '' && vars.LMS_PIPELINE_HOOK_URL || secrets.LMS_PIPELINE_HOOK_URL }}
+          WEBHOOK_SECRET: ${{ vars.WEBHOOK_SECRET != '' && vars.WEBHOOK_SECRET || secrets.WEBHOOK_SECRET }}
+          GITEA_REPOSITORY_ID: ${{ gitea.event.repository.id }}
+          SONAR_PROJECT_KEY_OVERRIDE: ${{ vars.SONAR_PROJECT_KEY }}
+          FAILED_STEP: ${{ gitea.job }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" != "success" ] && [ "$JOB_STATUS" != "failure" ]; then
+            echo "LMS notification skipped: job status ${JOB_STATUS}."
+            exit 0
+          fi
+          if [ -z "$LMS_CONTENT_URL" ] || [ -z "$WEBHOOK_SECRET" ]; then
+            echo "LMS notification skipped: LMS_CONTENT_URL ou WEBHOOK_SECRET não configurados." >&2
+            exit 0
+          fi
+          if [ -z "$GITEA_REPOSITORY_ID" ]; then
+            echo "LMS notification skipped: gitea.event.repository.id não disponível." >&2
+            exit 0
+          fi
+          apt-get update -qq && apt-get install -y -qq jq curl
+
+          resolve_hook_url() {
+            local base="${1%/}"
+            if [ -n "${LMS_PIPELINE_HOOK_URL:-}" ]; then
+              echo "${LMS_PIPELINE_HOOK_URL%/}"
+              return
+            fi
+            case "$base" in
+              */hooks/gitea/pipeline)
+                echo "$base"
+                ;;
+              */api/content|*.svc*|*.svc.cluster.local*|*:3000|*:3002|*localhost:3000|*localhost:3002)
+                echo "${base}/hooks/gitea/pipeline"
+                ;;
+              *)
+                echo "${base}/api/content/hooks/gitea/pipeline"
+                ;;
+            esac
+          }
+
+          post_webhook() {
+            local url="$1"
+            echo "URL completa do webhook: POST ${url}"
+            HTTP_CODE=$(curl -sS -o /tmp/lms-response.txt -w "%{http_code}" \
+              -X POST "${url}" \
+              -H "Content-Type: application/json" \
+              -H "X-Gitea-Hook-Token: ${WEBHOOK_SECRET}" \
+              -d "$BODY") || HTTP_CODE="000"
+            if [ "$HTTP_CODE" = "000" ]; then
+              echo "LMS notification request failed." >&2
+              return
+            fi
+            if [ "$HTTP_CODE" -ge 400 ]; then
+              echo "LMS notification failed with HTTP ${HTTP_CODE} (POST ${url})" >&2
+              cat /tmp/lms-response.txt >&2
+            else
+              echo "LMS notification sent successfully (HTTP ${HTTP_CODE})."
+            fi
+          }
+
+          LMS_CONTENT_URL="${LMS_CONTENT_URL%/}"
+          HOOK_URL="$(resolve_hook_url "$LMS_CONTENT_URL")"
+          echo "LMS_CONTENT_URL (base): ${LMS_CONTENT_URL}"
+          echo "Gitea repository: ${{ gitea.repository }} (giteaId=${GITEA_REPOSITORY_ID})"
+
+          SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY_OVERRIDE:-${SONAR_PROJECT_KEY:-}}"
+          if [ -z "$SONAR_PROJECT_KEY" ]; then
+            SONAR_PROJECT_KEY="${{ gitea.repository }}"
+            SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY//\//_}"
+          fi
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            BODY=$(jq -n \
+              --argjson giteaId "$GITEA_REPOSITORY_ID" \
+              --arg sonarProjectKey "$SONAR_PROJECT_KEY" \
+              '{giteaId: $giteaId, status: "SUCCESS", sonarProjectKey: $sonarProjectKey}')
+          else
+            BODY=$(jq -n \
+              --argjson giteaId "$GITEA_REPOSITORY_ID" \
+              --arg sonarProjectKey "$SONAR_PROJECT_KEY" \
+              --arg failedStep "${FAILED_STEP:-unknown}" \
+              '{giteaId: $giteaId, status: "FAILURE", sonarProjectKey: $sonarProjectKey, failedStep: $failedStep}')
+          fi
+
+          post_webhook "$HOOK_URL"
+
+          if [ "$HTTP_CODE" = "404" ] && [[ "$HOOK_URL" == *"/api/content/"* ]]; then
+            INTERNAL_BASE="${LMS_CONTENT_INTERNAL_URL:-http://content-prod-cwi-lms-content.lms-prod.svc.cluster.local:3000}"
+            INTERNAL_BASE="${INTERNAL_BASE%/}"
+            FALLBACK_URL="${INTERNAL_BASE}/hooks/gitea/pipeline"
+            if [ "$FALLBACK_URL" != "$HOOK_URL" ]; then
+              echo "404 via gateway; tentando URL interna do content service."
+              post_webhook "$FALLBACK_URL"
+            fi
+          fi
+
+          if [ "$HTTP_CODE" = "404" ]; then
+            if grep -q 'Repository not found for giteaId' /tmp/lms-response.txt 2>/dev/null; then
+              echo "Repositório não vinculado ao LMS (giteaId=${GITEA_REPOSITORY_ID})." >&2
+              echo "Esperado para repos criados pelo aluno via LMS; o template admin/template-java-21-maven não é registrado." >&2
+            else
+              echo "Dica: configure LMS_CONTENT_URL com a base do content API (ex.: http://content-prod-cwi-lms-content.lms-prod.svc.cluster.local:3000)" >&2
+              echo "ou LMS_PIPELINE_HOOK_URL com a URL completa do webhook." >&2
+            fi
+          fi

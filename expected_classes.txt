@@ -1,0 +1,6 @@
+Negociacao
+Clube
+Goleiro
+Atacante
+Indiferente
+Conservador
