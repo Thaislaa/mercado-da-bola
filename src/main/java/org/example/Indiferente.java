@@ -1,3 +1,5 @@
+package org.example;
+
 public class Indiferente implements ApetiteFinanceiro {
 
     @Override

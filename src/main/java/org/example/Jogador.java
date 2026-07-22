@@ -1,3 +1,5 @@
+package org.example;
+
 import java.math.BigDecimal;
 
 public abstract class Jogador {

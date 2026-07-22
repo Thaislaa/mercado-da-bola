@@ -1,3 +1,5 @@
+package org.example;
+
 public class Marcenario {
     public class Mercenario implements ApetiteFinanceiro {
 
