@@ -9,7 +9,7 @@ public abstract class Jogador {
     protected ApetiteFinanceiro apetiteFinanceiro;
     protected BigDecimal preco;
 
-    public Jogador(String nome,
+    protected Jogador(String nome,
                    int idade,
                    Clube clubeAtual,
                    int reputacaoHistorica,
